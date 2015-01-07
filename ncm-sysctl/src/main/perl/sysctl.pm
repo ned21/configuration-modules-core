@@ -24,10 +24,10 @@ use LC::Exception qw(throw_error);
 our $EC=LC::Exception::Context->new->will_store_all;
 our $NoActionSupported = 1;
 
+use CAF::FileWriter;
 use CAF::Process;
 use EDG::WP4::CCM::Element;
 use NCM::Check;
-
 
 ##########################################################################
 sub Configure {
@@ -39,52 +39,27 @@ sub Configure {
     my $variables = $sysctl_config->{variables};
     my $configFile = $sysctl_config->{confFile};
     my $changes;
-    unless ( $configFile ) {
-	$self->error('Sysctl configuration file not defined');
-    }
-
-    unless ($configFile =~ m{^(/.+)$}) {
-	throw_error("Invalid configuration file in the profile: $configFile");
-	return();
-    }
-    $configFile = $1;
     my $sysctl_exe = $sysctl_config->{command};
-    unless ( $sysctl_exe ) {
-	$self->error('Sysctl command not defined');
-    }
-
     unless ($sysctl_exe =~ m{^(/\S+)$}) {
-	throw_error("Invalid sysctl command on the profile: $sysctl_exe");
-	return();
+        throw_error("Invalid sysctl command on the profile: $sysctl_exe");
+        return();
     }
 
     $sysctl_exe = $1;
 
     unless (-x $sysctl_exe) {
-	$self->error ("$sysctl_exe not found");
-	return;
+        $self->error ("$sysctl_exe not found");
+        return;
     }
 
-    unless (-e $configFile && -w $configFile) {
-	$self->warn("Sysctl configuration file does not exist ",
-		    "or is not writable ($configFile)");
-	return;
-    }
-
-    foreach my $key (sort(keys(%$variables))) {
-	my $value = $variables->{$key};
-	my $st = NCM::Check::lines($configFile,
-				   backup => '.old',
-				   linere => '#?\s*'.$key.'\s*=.*',
-				   goodre => '\s*'.$key.'\s*=\s*'.$value,
-				   good => "$key = $value",
-				   add => 'last'
-				  );
-	if ($st < 0) {
-	    $self->error("Failed to update sysctl $key (value=$value)");
-	} else {
-	    $changes += $st;
-	}
+    if ($configFile =~ m{/}) {
+        $self->debug(1, "confFile setting is a path");
+        $changes = $self->sysctl_file($configFile, $sysctl_exe, $variables);
+    } else {
+        $self->debug(1, "confFile is a single file, using sysctl.d");
+        $changes = $self->sysctl_dir($configFile, $sysctl_exe, $variables);
+        # update the configFile path for the sysctl execution
+        $configFile = "/etc/sysctl.d/$configFile";
     }
 
     #
@@ -94,13 +69,60 @@ sub Configure {
         $self->verbose("Changes made to $configFile, running sysctl on it");
         my $cmd = CAF::Process->new([$sysctl_exe, '-p', $configFile],
                                     log => $self);
-	my $output = $cmd->output;
-        $self->debug(1, "$sysctl_exe output: $output");
+        my $output = $cmd->output;
         if ($? != 0) {
             $self->error("Error loading sysctl settings from $configFile: ".
                             "$output");
+        } else {
+            $self->debug(1, "$sysctl_exe output: $output");
         }
     }
+    return 1;
+}
+
+# new method for managing files in /etc/sysctl.d
+sub sysctl_dir {
+    my ($self, $configFile, $sysctl_exe, $variables) = @_;
+    # do not create a backup as it will be read in preference to the new one
+    my $fh = CAF::FileWriter->new("/etc/sysctl.d/$configFile",
+                                  owner => "root",
+                                  group => "root",
+                                  mode => 0444,
+                                  log => $self);
+    print $fh "# Written by ncm-sysctl, do not modify\n";
+    foreach my $key (sort(keys(%$variables))) {
+        my $value = $variables->{$key};
+        print $fh "$key = $value\n";
+    }
+    return $fh->close();
+}
+
+# legacy code for managing /etc/sysctl.conf
+sub sysctl_file {
+    my ($self, $configFile, $sysctl_exe, $variables) = @_;
+    unless (-e $configFile && -w $configFile) {
+        $self->warn("Sysctl configuration file does not exist ",
+                    "or is not writable ($configFile)");
+        return;
+    }
+
+    my $changes = 0;
+    foreach my $key (sort(keys(%$variables))) {
+        my $value = $variables->{$key};
+        my $st = NCM::Check::lines($configFile,
+                                   backup => '.old',
+                                   linere => '#?\s*'.$key.'\s*=.*',
+                                   goodre => '\s*'.$key.'\s*=\s*'.$value,
+                                   good => "$key = $value",
+                                   add => 'last'
+                                  );
+        if ($st < 0) {
+            $self->error("Failed to update sysctl $key (value=$value)");
+        } else {
+            $changes += $st;
+        }
+    }
+    return $changes;
 }
 
 1; # required for Perl modules
